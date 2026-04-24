@@ -1,368 +1,537 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
-import piexif
-import re
-from PIL import Image, ImageTk, ImageOps
+from tkinter import ttk
+import tkinter.filedialog
+import tkinter.messagebox
+import itertools
 from pathlib import Path
-from typing import List, Optional, Union
-from image_file_object import IFile
-from config import YEAR_DATES, HOMEDIR
-
-MAX_IMAGE_WIDTH = 470
-MAX_IMAGE_HEIGHT = 270
-
-RESIZE_VAL = 6
-group_patterns = ['group-name']
-DATE_MATCH_RE = re.compile(r"([12][0-9]+):([0-9]+):([0-9]+)")
+from image_pages import Page
+from editgroupnames import EditGroupNamesDialog
+from picture import group_patterns, Picture
+from config import RUN, si
+from image_file_object import NAME_MATCH_RE
 
 
-class Picture(tk.Frame):
-    def __init__(self, parent: tk.Widget, full_name_w_path: Union[str, Path], group_name: str = "group-name",
-                 display_height: Optional[int] = None):
+class DuplicateReviewDialog(tk.Toplevel):
+    def __init__(self, parent, duplicate_groups, app=None):
         super().__init__(parent)
-        self.file_name = IFile(full_name_w_path)
-        # Use IFile properties directly, removed redundant local paths
-        self.group_name = group_name
-        self.display_height = display_height
+        self.app = app
+        self.title("Review Duplicates")
+        self.geometry("1600x800")
+        self.duplicate_groups = duplicate_groups
+        self.current_index = 0
 
-        self.image_create_year: Optional[str] = None
-        self.image_create_month: str = ""
-        self.image_create_day: str = ""
-        self.rotation_angle: int = 0
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # This will hold the thumbnail image for display
-        self.pil_thumbnail: Optional[Image.Image] = None
+        # Main container
+        self.container = ttk.Frame(self)
+        self.container.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Hash for finding duplicates
-        self.dhash_value: Optional[str] = None
+        # Image area - scrollable in case of many duplicates? 
+        # For now, just a frame, assuming 2-3 duplicates fit on screen.
+        self.image_frame = ttk.Frame(self.container)
+        self.image_frame.pack(fill="both", expand=True)
 
-        # Load image, extract info, generate thumbnail, and then release the full image
-        self.load_and_process_initial_image()
+        # Navigation area
+        self.nav_frame = ttk.Frame(self.container)
+        self.nav_frame.pack(fill="x", pady=10)
 
-        self.tk_image: Optional[ImageTk.PhotoImage] = None
-        self.img_pict_label: Optional[tk.Label] = None
-        self.img_order_number: Optional[tk.Entry] = None
-        self.img_year: Optional[tk.Spinbox] = None
-        self.image_group_name: Optional[ttk.Combobox] = None
-        self.fullname_label: Optional[tk.Label] = None
+        self.lbl_info = ttk.Label(self.nav_frame, text="")
+        self.lbl_info.pack(side="left")
 
-        self.image_fullname_wo_ext = tk.StringVar(value=self.file_name.stem)
+        self.btn_delete = ttk.Button(self.nav_frame, text="Delete Selected", command=self.delete_selected)
+        self.btn_delete.pack(side="left", padx=20)
 
-        self.name_frame = tk.Frame(self)
+        self.btn_next = ttk.Button(self.nav_frame, text="Next", command=self.next_group)
+        self.btn_next.pack(side="right")
 
-        self.sel_year = tk.IntVar(value=1990)
-        self.sel_group_name = tk.StringVar(value="group-name")
-        self.sel_image_order_number = tk.StringVar(value="00000")
+        self.show_current_group()
 
-        self.img_rotate_btn: Optional[tk.Button] = None
+    def show_current_group(self):
+        # Clear existing images
+        for widget in self.image_frame.winfo_children():
+            widget.destroy()
 
-        self.checkbutton: Optional[tk.Checkbutton] = None
-        self.CheckVar = tk.IntVar(value=0)
-        self.config_image()
+        self.current_new_pics = []
 
-    def load_and_process_initial_image(self) -> None:
-        try:
-            with Image.open(self.file_name.filename_w_path) as full_img:
-                self.extract_exif_data(full_img)
-                # Bake orientation into a fresh image copy
-                upright_img = ImageOps.exif_transpose(full_img)
+        group = self.duplicate_groups[self.current_index]
+        self.lbl_info.config(text=f"Group {self.current_index + 1} of {len(self.duplicate_groups)}")
 
-                # Compute dHash
-                self.dhash_value = self.compute_dhash(upright_img)
-
-                # Generate thumbnail from the upright image
-                self.pil_thumbnail = self.size_raw_image(upright_img)
-        except IOError:
-            print(f"file not found: {self.file_name.filename_w_path}")
-            self.pil_thumbnail = None
-
-    def extract_exif_data(self, img: Image.Image) -> None:
-        if 'exif' not in img.info:
-            return
-
-        try:
-            exif_dict = piexif.load(img.info['exif'])
-        except (ValueError, TypeError) as e:
-            print(f"Exif Error Ignore exif data: {self.file_name.stem}\n{e}")
-            return
-
-        for ifd in ("0th", "Exif", "GPS", "1st"):
-            if ifd not in exif_dict: continue
-            for tag in exif_dict[ifd]:
-                if ifd not in piexif.TAGS or tag not in piexif.TAGS[ifd]:
-                    continue
-                tag_name = piexif.TAGS[ifd][tag]["name"]
-
-                if tag_name in ('DateTime', 'DateTimeOriginal'):
-                    val = exif_dict[ifd][tag]
-                    if isinstance(val, bytes):
-                        try:
-                            val_str = val.decode('utf-8')
-                        except Exception:
-                            val_str = str(val)
-                    else:
-                        val_str = str(val)
-
-                    if val_str and val_str.strip():
-                        try:
-                            date_time = self.get_date_parts(val_str.split()[0])
-                            self.image_create_year = date_time[0]
-                            self.image_create_month = date_time[1]
-                            self.image_create_day = date_time[2]
-                        except IndexError as e:
-                            print(f"Failed to parse date from EXIF for {self.file_name.stem} with val_str {val_str}: {e}")
-                        # Prefer DateTimeOriginal, but keep going
-                        if tag_name == 'DateTimeOriginal':
-                            pass  # We have what we need, but loop continues
-
-    @staticmethod
-    def compute_dhash(image: Image.Image, hash_size: int = 8) -> str:
-        """
-        Compute the difference hash (dHash) of an image.
-        1. Resize to (width, height) = (hash_size + 1, hash_size).
-        2. Convert to grayscale.
-        3. Compare adjacent pixels.
-        """
-        try:
-            # Resize to (width, height) = (hash_size + 1, hash_size)
-            resized = image.resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
-            # Convert to grayscale
-            gray = resized.convert("L")
-
-            pixels = list(gray.getdata())
-
-            decimal_value = 0
-            hex_string = []
-
-            for row in range(hash_size):
-                for col in range(hash_size):
-                    pixel_left = pixels[row * (hash_size + 1) + col]
-                    pixel_right = pixels[row * (hash_size + 1) + col + 1]
-                    if pixel_left > pixel_right:
-                        decimal_value |= 1 << (col % 8)
-
-                # After each row (8 bits), append to hex string
-                hex_string.append(f'{decimal_value:02x}')
-                decimal_value = 0
-
-            return "".join(hex_string)
-        except Exception as e:
-            print(f"Error computing dhash: {e}")
-            return ""
-
-    def config_image(self) -> None:
-        if self.image_create_year:
-            self.file_name.year = self.image_create_year
-
-        if self.pil_thumbnail:
-            self.tk_image = ImageTk.PhotoImage(self.pil_thumbnail)
-        else:
-            self.tk_image = None
-
-        self.checkbutton = tk.Checkbutton(self.name_frame, text="", variable=self.CheckVar)
-
-        # Create a container frame for the image to prevent layout shifts on rotation
-        square_dim = self.display_height if self.display_height else MAX_IMAGE_HEIGHT
-        if self.pil_thumbnail:
-            square_dim = max(self.pil_thumbnail.size)
-
-        self.img_container = tk.Frame(self, width=square_dim, height=square_dim)
-        self.img_container.pack_propagate(False)  # Fixed size
-
-        self.img_pict_label = tk.Label(self.img_container, image=self.tk_image, text=self.file_name.filename)
-        self.img_pict_label.image = self.tk_image
-        self.img_pict_label.bind('<ButtonPress-1>', self.selection_image)
-        self.img_pict_label.place(relx=0.5, rely=0.5, anchor="center")
-
-        self.fullname_label = tk.Label(self, textvariable=self.image_fullname_wo_ext)
-        self.fullname_label.bind('<ButtonPress-1>', self.selection_name)
-
-        self.img_order_number = tk.Entry(self.name_frame, width=6, textvariable=self.sel_image_order_number)
-        self.img_year = tk.Spinbox(self.name_frame, values=self.get_date_set(), textvariable=self.sel_year, wrap=True)
-        self.img_year.config(width=6)
-
-        # Updated to Combobox to allow editing
-        self.image_group_name = ttk.Combobox(self.name_frame, textvariable=self.sel_group_name, values=group_patterns)
-        self.image_group_name.config(width=25)
-        self.image_group_name.bind('<Enter>', self.update_combo)
-
-        rotate_path = Path(__file__).parent / 'rotation.jpg'
-
-        try:
-            with Image.open(rotate_path) as rotate_image:
-                rotate_btn = ImageTk.PhotoImage(rotate_image.resize((rotate_image.size[0] // 8, rotate_image.size[1] // 8),
-                                                                    Image.Resampling.LANCZOS))
-                self.img_rotate_btn = tk.Button(self.name_frame, width=30, image=rotate_btn, command=lambda: self.rotate(), pady=10)
-                self.img_rotate_btn.image = rotate_btn
-        except IOError:
-            # Fallback text button if image missing
-            self.img_rotate_btn = tk.Button(self.name_frame, text="Rotate", command=lambda: self.rotate(), pady=10)
-
-        # Set values AFTER widget creation to prevent Spinbox reset bug
-        if self.file_name.group_name:
-            self.sel_group_name.set(self.file_name.group_name)
-            self.add_group_name_list(self.file_name.group_name)
-
-        if self.file_name.year:
+        # Display images side-by-side
+        for original_pic in group:
+            # Create a new Picture instance for display
+            # We pass self.image_frame as parent
             try:
-                self.sel_year.set(int(self.file_name.year))
-            except (ValueError, TypeError):
-                # If year is not an integer (e.g. "0000" or garbage), default to 1990
-                self.sel_year.set(1990)
+                # We need to ensure we're passing the Path object
+                fpath = original_pic.file_name.filename_w_path
+                new_pic = Picture(self.image_frame, fpath, display_height=500)
+                new_pic.pack(side="left", padx=10, pady=10)
+                
+                self.current_new_pics.append(new_pic)
 
-        if self.file_name.order:
-            self.sel_image_order_number.set(self.file_name.order)
+                # Link check state
+                # Initial state from original
+                new_pic.CheckVar.set(original_pic.CheckVar.get())
 
-        if self.img_container: self.img_container.pack(side="top")
-        self.name_frame.pack(side="top")
-        if self.checkbutton: self.checkbutton.pack(side="left")
-        if self.image_group_name: self.image_group_name.pack(side="left")
-        if self.img_year: self.img_year.pack(side="left")
-        if self.img_order_number: self.img_order_number.pack(side="left")
-        if self.img_rotate_btn: self.img_rotate_btn.pack(side="left")
-        if self.fullname_label: self.fullname_label.pack(side="top")
+                # Update original when this one is toggled
+                def update_original(var_name, index, mode, orig=original_pic, new=new_pic):
+                    orig.CheckVar.set(new.CheckVar.get())
 
-    def update_combo(self, event=None) -> None:
-        if event:
-            pass
-        if not self.image_group_name: return
-
-        # With Combobox, we update 'values' instead of menu
-        # And let's make sure we include the current value if it's new
-        current = self.sel_group_name.get()
-        combo_values = list(group_patterns)  # Copy
-        if current and current not in combo_values:
-            combo_values.append(current)
-            combo_values.sort()
-
-        self.image_group_name['values'] = combo_values
-
-    def save_image(self) -> None:
-        # Re-load from disk, apply ops, save, release
-        try:
-            exif_bytes = b""
-            with Image.open(self.file_name.filename_w_path) as full_img:
-                # 1. Bake orientation (removes orientation tag from EXIF)
-                img_to_save = ImageOps.exif_transpose(full_img)
-
-                # 2. Capture the clean EXIF from the transposed image
-                # This ensures we have the metadata (date, etc) but NO orientation tag.
-                exif_bytes = img_to_save.info.get('exif', b"")
-
-                # 3. Apply manual rotation if any
-                if self.rotation_angle != 0:
-                    img_to_save = img_to_save.rotate(self.rotation_angle, expand=True)
-
-                # Ensure we have a copy in memory and file is closed before saving
-                img_to_save.load()
-
-            # 4. Save with the captured EXIF bytes
-            # Note: If rotate() preserved EXIF, passing it again is harmless.
-            # If rotate() dropped it, we are restoring the one from exif_transpose.
-            img_to_save.save(str(self.file_name.filename_w_path), "JPEG", exif=exif_bytes)
-            # Reset rotation angle since we baked it in
-            self.rotation_angle = 0
-
-        except Exception as e:
-            print(f"Failed to save image: {e}")
-            messagebox.showerror("Save Error", f"Failed to save image {self.file_name.filename}:\n{e}")
-
-    @staticmethod
-    def add_group_name_list(group_str: str) -> None:
-        if group_str not in group_patterns:
-            group_patterns.append(group_str)
-
-    @staticmethod
-    def get_date_set() -> List[str]:
-        return YEAR_DATES
-
-    @staticmethod
-    def get_group_set() -> List[str]:
-        return group_patterns
-
-    def size_raw_image(self, img: Image.Image) -> Image.Image:
-        if not img: return img
-        if self.display_height:
-            h_percent = (self.display_height / float(img.size[1]))
-            w_size = int((float(img.size[0]) * float(h_percent)))
-            return img.resize((w_size, self.display_height), Image.Resampling.LANCZOS)
-        return img.resize((img.size[0] // RESIZE_VAL, img.size[1] // RESIZE_VAL), Image.Resampling.LANCZOS)
-
-    def selection_name(self, event) -> None:
-        if event:
-            pass
-        if not self.fullname_label: return
-        self.tkraise()
-
-    def selection_image(self, evt) -> None:
-        widget = evt.widget
-        if widget.cget("text") != "":
-            # print(f"Reloading Selected Image: {widget.cget('text')}")
-            # For showing the image, we now need to re-load it temporarily
-            try:
-                with Image.open(self.file_name.filename_w_path) as full_img:
-                    # Apply view transformations
-                    view_img = ImageOps.exif_transpose(full_img)
-                    if self.rotation_angle != 0:
-                        view_img = view_img.rotate(self.rotation_angle, expand=True)
-                    view_img.show()
-            except IOError:
-                pass
-
-    def rotate(self) -> None:
-        if not self.pil_thumbnail:
-            return
-
-        # Rotate the thumbnail in memory
-        self.pil_thumbnail = self.pil_thumbnail.rotate(-90, expand=True)
-        self.tk_image = ImageTk.PhotoImage(self.pil_thumbnail)
-
-        if self.img_pict_label:
-            self.img_pict_label.configure(image=self.tk_image)
-            self.img_pict_label.image = self.tk_image
-
-        # Accumulate the rotation angle for when we eventually save
-        self.rotation_angle -= 90
-
-    def rename_file(self) -> None:
-        if self.CheckVar.get() == 1:
-            group = self.sel_group_name.get()
-            year = str(self.sel_year.get())
-            order = self.sel_image_order_number.get()
-
-            try:
-                # Perform the rename on the file object
-                self.file_name.update_and_rename(group, year, order)
-
-                # Update UI elements
-                self.image_fullname_wo_ext.set(self.file_name.stem)
-                if self.img_pict_label:
-                    self.img_pict_label.config(text=self.file_name.filename)
+                new_pic.CheckVar.trace_add("write", update_original)
             except Exception as e:
-                print(f"Error renaming {self.file_name.filename_w_path}: {e}")
+                print(f"Error displaying duplicate image: {e}")
 
-    @staticmethod
-    def get_date_parts(d: Union[str, bytes]) -> List[str]:
-        if isinstance(d, bytes):
+        # Update button text
+        if self.current_index == len(self.duplicate_groups) - 1:
+            self.btn_next.config(text="Close", command=self.on_close)
+        else:
+            self.btn_next.config(text="Next", command=self.next_group)
+
+    def next_group(self):
+        self.current_index += 1
+        if self.current_index < len(self.duplicate_groups):
+            self.show_current_group()
+
+    def delete_selected(self):
+        pics_to_delete = [pic for pic in getattr(self, 'current_new_pics', []) if pic.CheckVar.get() == 1]
+
+        if not pics_to_delete:
+            tkinter.messagebox.showinfo("Info", "No images selected to delete.")
+            return
+
+        deleted_count = 0
+        for pic in pics_to_delete:
+            fpath = pic.file_name.filename_w_path
+            filename = pic.file_name.filename
+
+            msg = f"Are you sure you want to delete '{filename}'?\nThis action cannot be undone."
+            if tkinter.messagebox.askyesno("Confirm Deletion", msg):
+                try:
+                    if fpath.exists():
+                        fpath.unlink()
+                        print(f"Deleted: {fpath}")
+                        deleted_count += 1
+                        if self.app:
+                            self.app.needs_refresh = True
+                    
+                    # Remove from the dialog UI immediately
+                    pic.destroy()
+                    if pic in self.current_new_pics:
+                        self.current_new_pics.remove(pic)
+                except Exception as e:
+                    print(f"Error deleting {fpath}: {e}")
+                    tkinter.messagebox.showerror("Error", f"Failed to delete {filename}\n{e}")
+
+    def on_close(self):
+        if self.app and getattr(self.app, 'needs_refresh', False):
+            self.app.load_images_from_current_dir()
+            self.app.needs_refresh = False
+        self.destroy()
+
+
+class ImageNamerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Bulk Photo Rename Tool")
+        self.root.geometry("2250x1200")
+
+        if RUN == "dev":
+            self.start_path = Path(si.dev_dir).parent
+        else:
+            self.start_path = Path(si.prod_dir).parent
+        # self.start_path = Path(HOMEDIR) / "Dropbox" / "Z" / "Photos"
+        self.image_extensions = ["*.jpg", "*.jpeg", "*.JPG", "*.JPEG", "*.png", "*.PNG"]
+        self.page = None
+
+        self.setup_ui()
+        self.load_initial_images()
+
+    def setup_ui(self):
+        # Main layout
+        main = ttk.Frame(self.root)
+        main.pack(fill="both", expand=True)
+
+        main.columnconfigure(0, weight=0)  # command palette
+        main.columnconfigure(1, weight=1)  # photo grid
+        main.rowconfigure(0, weight=1)  # Allow row 0 to expand vertically
+
+        ####################################
+        # Command Palette (Left Side)
+        ####################################
+
+        palette = ttk.Frame(main, padding=10)
+        palette.grid(row=0, column=0, sticky="ns")
+
+        # IMAGE SELECTION
+        selection_frame = ttk.LabelFrame(palette, text="Image Selection", padding=10)
+        selection_frame.pack(fill="x", pady=5)
+
+        ttk.Button(selection_frame, text="Select All", command=self.select_all).pack(fill="x", pady=2)
+        ttk.Button(selection_frame, text="Clear Selected", command=self.clear_selected).pack(fill="x", pady=2)
+
+        # GROUP
+        group_frame = ttk.LabelFrame(palette, text="File Name Format", padding=10)
+        group_frame.pack(fill="x", pady=5)
+
+        ttk.Label(group_frame, text="Group Name").pack(anchor="w")
+
+        self.use_global_group_name_var = tk.BooleanVar()
+        group_frame.pack(pady=5)
+        ttk.Checkbutton(group_frame, text="Use Global Group Name", variable=self.use_global_group_name_var).pack(pady=5)
+
+        self.global_group_combo = ttk.Combobox(group_frame, values=group_patterns)
+        self.global_group_combo.pack(fill="x", pady=2)
+        if group_patterns:
+            self.global_group_combo.current(0)
+
+        ttk.Button(group_frame, text="Edit Groups", command=self.edit_groups).pack(fill="x", pady=2)
+
+        # SEQUENCE
+
+        start_frame = ttk.Frame(group_frame, padding=10)
+        start_frame.pack(pady=5)
+        ttk.Label(start_frame, text="Start Number").pack(side="left")
+        self.start_entry = ttk.Entry(start_frame, width=10)
+        self.start_entry.insert(0, "00001")
+        self.start_entry.pack(side="right", padx=5)
+
+        self.renumber_var = tk.BooleanVar()
+        renumber_frame = ttk.Frame(group_frame, padding=10)
+        renumber_frame.pack(pady=5)
+        ttk.Checkbutton(renumber_frame, text="Renumber Existing Files", variable=self.renumber_var).pack(pady=5)
+
+        # ACTIONS
+        action_frame = ttk.LabelFrame(palette, text="Actions", padding=10)
+        action_frame.pack(fill="x", pady=5)
+
+        ttk.Button(action_frame, text="Rename Selected", command=self.rename_selected).pack(fill="x", pady=3)
+        ttk.Button(action_frame, text="Delete Selected", command=self.delete_selected).pack(fill="x", pady=3)
+
+        # UTILITIES
+        util_frame = ttk.LabelFrame(palette, text="Utilities", padding=10)
+        util_frame.pack(fill="x", pady=5)
+
+        ttk.Button(util_frame, text="Refresh Images", command=self.load_images_from_current_dir).pack(fill="x", pady=2)
+        ttk.Button(util_frame, text="Select Duplicates", command=self.select_duplicates).pack(fill="x", pady=2)
+        ttk.Button(util_frame, text="Change Image Folder", command=self.change_image_folder).pack(fill="x", pady=2)
+
+        # SAVE & EXIT
+        save_exit_frame = ttk.Frame(palette, padding=10)
+        save_exit_frame.pack(side="bottom", fill="x", pady=5)
+
+        ttk.Button(save_exit_frame, text="Exit", command=self.root.destroy).pack(side="left", fill="x", expand=True, padx=2)
+        ttk.Button(save_exit_frame, text="Save", command=self.rename_selected).pack(side="right", fill="x", expand=True, padx=2)
+
+        ####################################
+        # Photo Grid Area (Right Side)
+        ####################################
+
+        self.grid_area = ttk.Frame(main, padding=10)
+        self.grid_area.grid(row=0, column=1, sticky="nsew")
+
+        # We want the grid area to expand
+        self.grid_area.columnconfigure(0, weight=1)
+        self.grid_area.rowconfigure(0, weight=1)
+
+    def load_initial_images(self):
+        # Find test images
+        # Asking for directory on startup might be annoying if it pops up every time during dev,
+        # but preserving original logic.
+        initial_dir = tkinter.filedialog.askdirectory(initialdir=self.start_path, title="Select Directory with Images")
+        if initial_dir:
+            self.load_images(Path(initial_dir))
+
+    def change_image_folder(self):
+        new_dir = tkinter.filedialog.askdirectory(initialdir=self.start_path, title="Select Directory with Images")
+        if new_dir:
+            self.load_images(Path(new_dir))
+
+    def load_images_from_current_dir(self):
+        if hasattr(self, 'current_image_dir') and self.current_image_dir:
+            self.load_images(self.current_image_dir)
+
+    def load_images(self, image_dir: Path):
+        self.current_image_dir = image_dir
+        # Combine multiple generators into one
+        image_files = sorted(list(set(itertools.chain.from_iterable(image_dir.glob(ext) for ext in self.image_extensions))))
+
+        max_seq = -1
+        found_groups = set()
+        
+        self.used_sequences = set()
+        self.provisional_orders = {}
+
+        # First pass: find properly formatted files and max seq
+        for f in image_files:
+            m = NAME_MATCH_RE.match(f.name)
+            if m:
+                found_groups.add(m.group(1))
+                try:
+                    seq = int(m.group(3))
+                    self.used_sequences.add(m.group(3))
+                    if seq > max_seq:
+                        max_seq = seq
+                except ValueError:
+                    pass
+
+        # Update global group_patterns list with found groups
+        for g in found_groups:
+            if g not in group_patterns:
+                group_patterns.append(g)
+
+        group_patterns.sort()
+
+        # Update the combobox values
+        if hasattr(self, 'global_group_combo'):
+            self.global_group_combo['values'] = group_patterns
+
+        if max_seq == -1:
+            next_start = 10000
+        else:
+            next_start = max_seq + 10
+
+        # Second pass: assign provisional orders to unformatted files
+        current_provisional_seq = next_start
+        for f in image_files:
+            m = NAME_MATCH_RE.match(f.name)
+            if not m:
+                # Find the next available sequence
+                while f"{current_provisional_seq:05d}" in self.used_sequences:
+                    current_provisional_seq += 10
+                
+                prov_str = f"{current_provisional_seq:05d}"
+                self.provisional_orders[f] = prov_str
+                self.used_sequences.add(prov_str)
+                current_provisional_seq += 10
+
+        self.start_entry.delete(0, tk.END)
+        self.start_entry.insert(0, f"{current_provisional_seq:05d}")
+
+        # Clear existing page if it exists
+        if self.page:
+            self.page.destroy()
+            self.page = None
+            # Also clear any labels in grid_area if they exist (like "No images found")
+            for widget in self.grid_area.winfo_children():
+                widget.destroy()
+
+        if not image_files:
+            # Fallback if no images found
+            lbl = tk.Label(self.grid_area, text=f"No .jpg images found in {image_dir}")
+            lbl.pack()
+        else:
+            # Instantiate the Page class
+            self.page = Page(self.grid_area, image_files, rows=3, columns=4, provisional_orders=self.provisional_orders)
+            # The Page is a Frame, so we grid it to fill the grid_area
+            self.page.grid(row=0, column=0, sticky="nsew")
+
+    def edit_groups(self):
+        # Pass the current list to the dialog
+        dlg = EditGroupNamesDialog(self.root, group_patterns)
+        # The dialog is modal, so code resumes here after it closes
+
+        # Update the global list in place so Picture objects see it
+        if dlg.glist:
+            # Filter out empty strings if any
+            new_list = [g for g in dlg.glist if g.strip()]
+            if new_list:
+                # Update in place using slice assignment
+                group_patterns[:] = new_list
+
+            # Update the local combobox
+            if hasattr(self, 'global_group_combo'):
+                self.global_group_combo['values'] = group_patterns
+
+    def select_all(self):
+        if self.page:
+            self.page.select_all()
+
+    def clear_selected(self):
+        if self.page:
+            self.page.clear_selected()
+
+    def rename_selected(self):
+        if not self.page:
+            return
+
+        renumber = self.renumber_var.get()
+        use_global_group = self.use_global_group_name_var.get()
+        global_group_str = ""
+        if use_global_group and hasattr(self, 'global_group_combo'):
+            global_group_str = self.global_group_combo.get().strip()
+
+        # Get start number for autofilling or renumbering
+        try:
+            current_seq = int(self.start_entry.get())
+        except ValueError:
+            current_seq = 10000
+
+        seq_modified = False
+
+        # First pass: Validation and Data Collection
+        selected_pics = [p for p in self.page.pictures if p.CheckVar.get() == 1]
+        if not selected_pics:
+            return
+
+        # Collision detection preparation
+        proposed_names = set()
+        
+        for pic in selected_pics:
+            if use_global_group:
+                g_name = global_group_str
+            else:
+                g_name = pic.sel_group_name.get().strip()
+            
+            year = pic.sel_year.get()
+            order = pic.sel_image_order_number.get().strip()
+            
+            # If renumbering or empty order, we'll assign one, so skip order validation
+            if renumber or not order or order == '0':
+                order = f"{current_seq:05d}"
+                current_seq += 10
+                seq_modified = True
+
+            if not str(order).isdigit():
+                tkinter.messagebox.showerror("Error", f"Invalid number format for {pic.file_name.filename}")
+                return
+
+            if not g_name:
+                tkinter.messagebox.showerror("Error", f"Group Name is required for {pic.file_name.filename}\n(If using Global Group Name, ensure it is entered)")
+                return
+
+            # Simple year validation
             try:
-                d_str = d.decode('utf-8')
-            except UnicodeDecodeError:
-                d_str = str(d)
+                y = int(year)
+                if y < 1900 or y > 2030: raise ValueError
+            except:
+                tkinter.messagebox.showerror("Error", f"Invalid year for {pic.file_name.filename}")
+                return
+
+            # Proposed filename check
+            from config import FILE_EXTENSION
+            proposed_filename = f"{g_name}-{year}-{order}{FILE_EXTENSION}"
+            
+            # Check if this rename conflicts with another file in the selection
+            if proposed_filename in proposed_names:
+                tkinter.messagebox.showerror("Error", f"Duplicate order numbers not allowed.\n\nMultiple images are trying to use the sequence '{order}'.")
+                return
+            proposed_names.add(proposed_filename)
+
+            # Check if this rename conflicts with a file already on disk (that isn't this very file)
+            target_path = pic.file_name.filename_w_path.with_name(proposed_filename)
+            if target_path.exists() and target_path != pic.file_name.filename_w_path:
+                tkinter.messagebox.showerror("Error", f"Duplicate order numbers not allowed.\n\nThe file '{proposed_filename}' already exists in this directory.")
+                return
+
+        # Second pass: Execution
+        for pic in selected_pics:
+            if use_global_group:
+                g_name = global_group_str
+                # Update the picture object's group name to reflect the global choice
+                pic.sel_group_name.set(g_name)
+            else:
+                g_name = pic.sel_group_name.get().strip()
+            
+            # Add to global list if new
+            if g_name and g_name not in group_patterns:
+                group_patterns.append(g_name)
+                group_patterns.sort()
+
+            order = pic.sel_image_order_number.get().strip()
+
+            # Apply Numbering Logic
+            if renumber or not order or order == '0':
+                # Re-calculate here since we just validated it works above
+                order = f"{current_seq_exec:05d}" if 'current_seq_exec' in locals() else f"{int(self.start_entry.get()):05d}"
+                if 'current_seq_exec' not in locals():
+                    current_seq_exec = int(self.start_entry.get()) + 10
+                else:
+                    current_seq_exec += 10
+                pic.sel_image_order_number.set(order)
+            
+            # Record it globally so next scan doesn't reuse it
+            self.used_sequences.add(str(order))
+
+            # Rename
+            pic.rename_file()
+            
+            # Check for rotation and save if needed
+            if pic.rotation_angle % 360 != 0:
+                pic.save_image()
+                
+            pic.CheckVar.set(0)
+
+        # Update global combo values if changed
+        if hasattr(self, 'global_group_combo'):
+            self.global_group_combo['values'] = group_patterns
+
+        # Update start entry if we used the sequence
+        if seq_modified:
+            self.start_entry.delete(0, tk.END)
+            self.start_entry.insert(0, f"{current_seq:05d}")
+
+        # Always uncheck renumber after batch operation
+        if renumber:
+            self.renumber_var.set(False)
+
+    def delete_selected(self):
+        if not self.page:
+            return
+
+        pics_to_delete = [pic for pic in self.page.pictures if pic.CheckVar.get() == 1]
+
+        if not pics_to_delete:
+            tkinter.messagebox.showinfo("Info", "No images selected to delete.")
+            return
+
+        deleted_count = 0
+
+        for pic in pics_to_delete:
+            fpath = pic.file_name.filename_w_path
+            filename = pic.file_name.filename
+
+            msg = f"Are you sure you want to delete '{filename}'?\nThis action cannot be undone."
+            if tkinter.messagebox.askyesno("Confirm Deletion", msg):
+                try:
+                    if fpath.exists():
+                        fpath.unlink()
+                        print(f"Deleted: {fpath}")
+                        deleted_count += 1
+                except Exception as e:
+                    print(f"Error deleting {fpath}: {e}")
+                    tkinter.messagebox.showerror("Error", f"Failed to delete {filename}\n{e}")
+
+        if deleted_count > 0:
+            # Refresh the view to show remaining images
+            self.load_images_from_current_dir()
+
+    def select_duplicates(self):
+        if not self.page:
+            return
+
+        # Map to store hash -> list of pictures
+        hash_map = {}
+
+        # Reset selection first so user starts with a clean slate
+        self.clear_selected()
+
+        for pic in self.page.pictures:
+            h = pic.dhash_value
+            if h:
+                if h in hash_map:
+                    hash_map[h].append(pic)
+                else:
+                    hash_map[h] = [pic]
+
+        # Filter groups with > 1 image
+        duplicate_groups = [group for group in hash_map.values() if len(group) > 1]
+
+        if duplicate_groups:
+            DuplicateReviewDialog(self.root, duplicate_groups, app=self)
         else:
-            d_str = str(d)
-
-        m = DATE_MATCH_RE.match(d_str)
-        if m:
-            return [m.group(1), m.group(2), m.group(3)]
-        else:
-            return ["1990", "", ""]
+            tkinter.messagebox.showinfo("No Duplicates", "No duplicate images found based on visual hashing.")
 
 
-if __name__ == '__main__':
-    from pathlib import Path
-
+if __name__ == "__main__":
     root = tk.Tk()
-    test_path = Path(HOMEDIR) / "Desktop" / "test.jpg"
-    image_frame = Picture(root, test_path)
-    image_frame.pack()
-    tk.mainloop()
+    app = ImageNamerApp(root)
+    root.mainloop()

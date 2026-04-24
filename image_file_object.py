@@ -10,12 +10,13 @@ NAME_MATCH_RE = re.compile(r"([a-zA-Z0-9 &_\-]+)-([012][0-9]{3})-([0-9]{5})(\.[j
 
 
 class IFile:
-    def __init__(self, file_path: Union[str, Path], order_number: int = 0):
+    def __init__(self, file_path: Union[str, Path], order_number: int = 0, provisional_order: Optional[str] = None):
         if file_path is None:
             raise ValueError("File path cannot be None")
 
         self._full_filename_w_path = Path(file_path)
         self._order_number = order_number
+        self._provisional_order = provisional_order
         self._group_name: Optional[str] = None
         self._year: Optional[str] = None
         self._order: Optional[str] = None
@@ -115,7 +116,8 @@ class IFile:
         if m:
             return [m.group(1), m.group(2), m.group(3), ".jpg"]
         else:
-            return ["group-name", "1990", str(self._order_number), FILE_EXTENSION]
+            default_order = self._provisional_order if self._provisional_order else str(self._order_number)
+            return ["group-name", "1990", default_order, FILE_EXTENSION]
 
     def construct_filename(self) -> str:
         return f"{self._group_name}-{self._year}-{self._order}{FILE_EXTENSION}"
