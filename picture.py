@@ -18,9 +18,9 @@ DATE_MATCH_RE = re.compile(r"([12][0-9]+):([0-9]+):([0-9]+)")
 
 class Picture(tk.Frame):
     def __init__(self, parent: tk.Widget, full_name_w_path: Union[str, Path], group_name: str = "group-name",
-                 display_height: Optional[int] = None):
+                 display_height: Optional[int] = None, provisional_order: Optional[str] = None):
         super().__init__(parent)
-        self.file_name = IFile(full_name_w_path)
+        self.file_name = IFile(full_name_w_path, provisional_order=provisional_order)
         # Use IFile properties directly, removed redundant local paths
         self.group_name = group_name
         self.display_height = display_height
@@ -67,11 +67,12 @@ class Picture(tk.Frame):
                 # Bake orientation into a fresh image copy
                 upright_img = ImageOps.exif_transpose(full_img)
 
-                # Compute dHash
-                self.dhash_value = self.compute_dhash(upright_img)
-
-                # Generate thumbnail from the upright image
+                # Generate thumbnail from the upright image FIRST
                 self.pil_thumbnail = self.size_raw_image(upright_img)
+
+                # Compute dHash using the smaller thumbnail ONLY if not cached
+                if not self.dhash_value and self.pil_thumbnail:
+                    self.dhash_value = self.compute_dhash(self.pil_thumbnail)
         except IOError:
             print(f"file not found: {self.file_name.filename_w_path}")
             self.pil_thumbnail = None
@@ -222,6 +223,53 @@ class Picture(tk.Frame):
         if self.img_rotate_btn: self.img_rotate_btn.pack(side="left")
         if self.fullname_label: self.fullname_label.pack(side="top")
 
+    def load_new_image(self, new_full_name_w_path: Union[str, Path], cached_dhash: Optional[str] = None, provisional_order: Optional[str] = None) -> None:
+        self.file_name = IFile(new_full_name_w_path, provisional_order=provisional_order)
+        
+        self.image_create_year = None
+        self.image_create_month = ""
+        self.image_create_day = ""
+        self.rotation_angle = 0
+        self.pil_thumbnail = None
+        self.dhash_value = cached_dhash
+        self.CheckVar.set(0)
+        
+        self.load_and_process_initial_image()
+        
+        if self.image_create_year:
+            self.file_name.year = self.image_create_year
+            
+        if self.pil_thumbnail:
+            self.tk_image = ImageTk.PhotoImage(self.pil_thumbnail)
+        else:
+            self.tk_image = None
+            
+        if self.img_pict_label:
+            self.img_pict_label.config(image=self.tk_image, text=self.file_name.filename)
+            self.img_pict_label.image = self.tk_image
+            
+        if self.fullname_label:
+            self.image_fullname_wo_ext.set(self.file_name.stem)
+
+        if self.file_name.group_name:
+            self.sel_group_name.set(self.file_name.group_name)
+            self.add_group_name_list(self.file_name.group_name)
+        else:
+            self.sel_group_name.set("group-name")
+
+        if self.file_name.year:
+            try:
+                self.sel_year.set(int(self.file_name.year))
+            except (ValueError, TypeError):
+                self.sel_year.set(1990)
+        else:
+            self.sel_year.set(1990)
+
+        if self.file_name.order:
+            self.sel_image_order_number.set(self.file_name.order)
+        else:
+            self.sel_image_order_number.set("00000")
+
     def update_combo(self, event=None) -> None:
         if event:
             pass
@@ -262,6 +310,8 @@ class Picture(tk.Frame):
             img_to_save.save(str(self.file_name.filename_w_path), "JPEG", exif=exif_bytes)
             # Reset rotation angle since we baked it in
             self.rotation_angle = 0
+            
+            print(f"Successfully saved rotated image: {self.file_name.filename_w_path}")
 
         except Exception as e:
             print(f"Failed to save image: {e}")
@@ -285,8 +335,14 @@ class Picture(tk.Frame):
         if self.display_height:
             h_percent = (self.display_height / float(img.size[1]))
             w_size = int((float(img.size[0]) * float(h_percent)))
-            return img.resize((w_size, self.display_height), Image.Resampling.LANCZOS)
-        return img.resize((img.size[0] // RESIZE_VAL, img.size[1] // RESIZE_VAL), Image.Resampling.LANCZOS)
+            target_size = (w_size, self.display_height)
+        else:
+            target_size = (img.size[0] // RESIZE_VAL, img.size[1] // RESIZE_VAL)
+        
+        # Use thumbnail() with BILINEAR for a massive speedup over resize(LANCZOS)
+        thumb = img.copy()
+        thumb.thumbnail(target_size, Image.Resampling.BILINEAR)
+        return thumb
 
     def selection_name(self, event) -> None:
         if event:
@@ -322,7 +378,7 @@ class Picture(tk.Frame):
             self.img_pict_label.image = self.tk_image
 
         # Accumulate the rotation angle for when we eventually save
-        self.rotation_angle -= 90
+        self.rotation_angle = (self.rotation_angle - 90) % 360
 
     def rename_file(self) -> None:
         if self.CheckVar.get() == 1:
@@ -338,6 +394,10 @@ class Picture(tk.Frame):
                 self.image_fullname_wo_ext.set(self.file_name.stem)
                 if self.img_pict_label:
                     self.img_pict_label.config(text=self.file_name.filename)
+                    
+                # Update the page's valid_image_paths so recycling works properly
+                if hasattr(self, 'current_image_index') and hasattr(self, 'page_ref'):
+                    self.page_ref.valid_image_paths[self.current_image_index] = self.file_name.filename_w_path
             except Exception as e:
                 print(f"Error renaming {self.file_name.filename_w_path}: {e}")
 

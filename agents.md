@@ -7,6 +7,8 @@
 * **Tasks**: 
     * Define `tk.Frame` hierarchies.
     * Calculate widget padding and expansion weights.
+    * Preserve the app split used in `ImageNamerApp.setup_ui()`: fixed-width command palette (`column 0, weight 0`) and expandable photo grid (`column 1, weight 1`).
+    * For image browsing, follow `Page` virtualization in `image_pages.py` (canvas + inner frame + widget pool) instead of rendering all files as live `Picture` widgets.
 
 ## 2. The Logic Controller
 * **Role**: Event-Driven Programming Specialist
@@ -15,6 +17,11 @@
 * **Tasks**: 
     * Writing `command=` lambda functions.
     * Managing `tk.StringVar` and `tk.BooleanVar` updates.
+    * Keep rename behavior two-pass in `ImageNamerApp.rename_selected()`: validate collisions first, then execute `pic.rename_file()`.
+    * Preserve virtualization state keys in `Page.image_states` (`checked`, `group`, `year`, `order`, `dhash`) so scroll eviction/restoration remains lossless.
+    * Keep rotation persistence hooks in both `Page.update_cache()` (eviction save) and `Page.destroy()` (final save before page teardown).
+    * Duplicate review flow is `Picture.compute_dhash()` -> `ImageNamerApp.select_duplicates()` -> `DuplicateReviewDialog`.
+    * Use the root script-style checks (for example `test_destroy.py`, `test_scroll_evict.py`, `test_user_flow.py`) when changing cache/rotation behavior.
 
 ## 3. The Stylist (Theming Agent)
 * **Role**: Tkinter Theme & Widget Specialist
@@ -23,3 +30,6 @@
 * **Tasks**: 
     * Configuring `ttk.Style`.
     * Mapping color hex codes and font families.
+    * Match current mixed-widget convention: `ttk` for command palette/dialog controls, `tk` widgets in `Picture` for image-centric controls and bindings.
+    * Do not break fixed image presentation constraints in `Picture.config_image()` (square container + centered label) or the white canvas background used by `Page`.
+    * Keep group-name UX consistent with editable `ttk.Combobox` values sourced from shared `group_patterns` and refreshed via `Picture.update_combo()`.
